@@ -40,11 +40,14 @@ import (
 // CmdProcessorAdapter is interface for differentiating the specific database implementations.
 // For example there is an adapter for MySQL, another for Oracle
 type CmdProcessorAdapter interface {
-	InitDB() (*sql.DB, error)
-	UseBindNames() bool
 	GetColTypeMap() map[string]int
-	// this is used for date related types to translate between the database format to the mux format
+	Heartbeat(*sql.DB) bool
+	InitDB() (*sql.DB, error)
+	/* ProcessError's workerScope["child_shutdown_flag"] = "1 or anything" can help terminate after the request */
+	ProcessError(errToProcess error, workerScope *WorkerScopeType, queryScope *QueryScopeType)
+	// ProcessResult is used for date related types to translate between the database format to the mux format
 	ProcessResult(colType string, res string) string
+	UseBindNames() bool
 }
 
 // bindType defines types of bind variables
@@ -87,10 +90,6 @@ type CmdProcessor struct {
 	// db instance.
 	//
 	db *sql.DB
-	//
-	// the connection
-	//
-	conn *sql.Conn
 	//
 	// open txn if having dml.
 	//
@@ -151,6 +150,21 @@ type CmdProcessor struct {
 	sqlHash uint32
 	// the name of the cal TXN
 	calSessionTxnName string
+	heartbeat         bool
+	// counter for requests, acting like ID
+	rqId uint16
+	// used in eor() to send the right code
+	moreIncomingRequests func() bool
+	queryScope           QueryScopeType
+	WorkerScope          WorkerScopeType
+}
+
+type QueryScopeType struct {
+	NsCmd   string
+	SqlHash string
+}
+type WorkerScopeType struct {
+	Child_shutdown_flag bool
 }
 
 // NewCmdProcessor creates the processor using th egiven adapter
@@ -160,7 +174,7 @@ func NewCmdProcessor(adapter CmdProcessorAdapter, sockMux *os.File) *CmdProcesso
 		cs = "CLIENT_SESSION"
 	}
 
-	return &CmdProcessor{adapter: adapter, SocketOut: sockMux, calSessionTxnName: cs}
+	return &CmdProcessor{adapter: adapter, SocketOut: sockMux, calSessionTxnName: cs, heartbeat: true}
 }
 
 // ProcessCmd implements the client commands like prepare, bind, execute, etc
@@ -173,6 +187,7 @@ func (cp *CmdProcessor) ProcessCmd(ns *netstring.Netstring) error {
 	}
 	var err error
 
+	cp.queryScope.NsCmd = fmt.Sprintf("%d", ns.Cmd)
 outloop:
 	switch ns.Cmd {
 	case common.CmdClientCalCorrelationID:
@@ -183,8 +198,10 @@ outloop:
 			cp.calSessionTxn.SetCorrelationID("@todo")
 		}
 	case common.CmdPrepare, common.CmdPrepareV2, common.CmdPrepareSpecial:
+		cp.queryScope = QueryScopeType{}
 		cp.lastErr = nil
 		cp.sqlHash = 0
+		cp.heartbeat = false // for hb
 		//
 		// need to turn "select * from table where ca=:a and cb=:b"
 		// to "select * from table where ca=? and cb=?"
@@ -205,9 +222,14 @@ outloop:
 			cp.calSessionTxn = cal.NewCalTransaction(cal.TransTypeAPI, cp.calSessionTxnName, cal.TransOK, "", cal.DefaultTGName)
 		}
 		cp.sqlHash = utility.GetSQLHash(string(ns.Payload))
+		cp.queryScope.SqlHash = fmt.Sprintf("%d", cp.sqlHash)
 		cp.calExecTxn = cal.NewCalTransaction(cal.TransTypeExec, fmt.Sprintf("%d", cp.sqlHash), cal.TransOK, "", cal.DefaultTGName)
 		if (cp.tx == nil) && (startTrans) {
 			cp.tx, err = cp.db.Begin()
+		}
+		if cp.stmt != nil {
+			cp.stmt.Close()
+			cp.stmt = nil
 		}
 		if cp.tx != nil {
 			cp.stmt, err = cp.tx.Prepare(sqlQuery)
@@ -215,6 +237,7 @@ outloop:
 			cp.stmt, err = cp.db.Prepare(sqlQuery)
 		}
 		if err != nil {
+			cp.adapter.ProcessError(err, &cp.WorkerScope, &cp.queryScope)
 			cp.calExecErr("Prepare", err.Error())
 			cp.lastErr = err
 			err = nil
@@ -375,6 +398,7 @@ outloop:
 				}
 			}
 			if err != nil {
+				cp.adapter.ProcessError(err, &cp.WorkerScope, &cp.queryScope)
 				cp.calExecErr("RC", err.Error())
 				if logger.GetLogger().V(logger.Warning) {
 					logger.GetLogger().Log(logger.Warning, "Execute error:", err.Error())
@@ -384,6 +408,7 @@ outloop:
 				} else {
 					cp.eor(common.EORFree, netstring.NewNetstringFrom(common.RcSQLError, []byte(err.Error())))
 				}
+				cp.lastErr = err
 				err = nil
 				break
 			}
@@ -463,7 +488,7 @@ outloop:
 							cp.eor(EOR_IN_CURSOR_NOT_IN_TRANSACTION, resns)
 						}
 					*/
-					WriteAll(cp.SocketOut, resns.Serialized)
+					WriteAll(cp.SocketOut, resns)
 				} else {
 					if cp.inTrans {
 						cp.eor(common.EORInTransaction, resns)
@@ -504,6 +529,7 @@ outloop:
 			for cp.rows.Next() {
 				err = cp.rows.Scan(readCols...)
 				if err != nil {
+					cp.adapter.ProcessError(err, &cp.WorkerScope, &cp.queryScope)
 					if logger.GetLogger().V(logger.Warning) {
 						logger.GetLogger().Log(logger.Warning, "fetch:", err.Error())
 					}
@@ -525,7 +551,7 @@ outloop:
 			}
 			if len(nss) > 0 {
 				resns := netstring.NewNetstringEmbedded(nss)
-				err = WriteAll(cp.SocketOut, resns.Serialized)
+				err = WriteAll(cp.SocketOut, resns)
 				if err != nil {
 					if logger.GetLogger().V(logger.Warning) {
 						logger.GetLogger().Log(logger.Warning, "Error writing to mux", err.Error())
@@ -544,10 +570,15 @@ outloop:
 			}
 			cp.rows = nil
 		} else {
+			// send back to client only if last result was ok
+			var nsr *netstring.Netstring
+			if cp.lastErr == nil {
+				nsr = netstring.NewNetstringFrom(common.RcError, []byte("fetch requested but no statement exists"))
+			}
 			if cp.inTrans {
-				cp.eor(common.EORInTransaction, netstring.NewNetstringFrom(common.RcError, []byte("fetch requested but no statement exists")))
+				cp.eor(common.EORInTransaction, nsr)
 			} else {
-				cp.eor(common.EORFree, netstring.NewNetstringFrom(common.RcError, []byte("fetch requested but no statement exists")))
+				cp.eor(common.EORFree, nsr)
 			}
 		}
 	case common.CmdColsInfo:
@@ -568,7 +599,7 @@ outloop:
 		}
 		if cts == nil {
 			ns := netstring.NewNetstringFrom(common.RcValue, []byte("0"))
-			err = WriteAll(cp.SocketOut, ns.Serialized)
+			err = WriteAll(cp.SocketOut, ns)
 		} else {
 			nss := make([]*netstring.Netstring, len(cts)*5+1)
 			nss[0] = netstring.NewNetstringFrom(common.RcValue, []byte(strconv.Itoa(len(cts))))
@@ -615,7 +646,7 @@ outloop:
 				cnt++
 			}
 			resns := netstring.NewNetstringEmbedded(nss)
-			err = WriteAll(cp.SocketOut, resns.Serialized)
+			err = WriteAll(cp.SocketOut, resns)
 		}
 	case common.CmdCommit:
 		if logger.GetLogger().V(logger.Debug) {
@@ -625,6 +656,7 @@ outloop:
 			calevt := cal.NewCalEvent("COMMIT", "Local", cal.TransOK, "")
 			err = cp.tx.Commit()
 			if err != nil {
+				cp.adapter.ProcessError(err, &cp.WorkerScope, &cp.queryScope)
 				if logger.GetLogger().V(logger.Warning) {
 					logger.GetLogger().Log(logger.Warning, "Commit error:", err.Error())
 				}
@@ -651,6 +683,7 @@ outloop:
 			calevt := cal.NewCalEvent("ROLLBACK", "Local", cal.TransOK, "")
 			err = cp.tx.Rollback()
 			if err != nil {
+				cp.adapter.ProcessError(err, &cp.WorkerScope, &cp.queryScope)
 				if logger.GetLogger().V(logger.Warning) {
 					logger.GetLogger().Log(logger.Warning, "Rollback error:", err.Error())
 				}
@@ -677,6 +710,12 @@ outloop:
 	return err
 }
 
+func (cp *CmdProcessor) SendDbHeartbeat() bool {
+	var masterIsUp bool
+	masterIsUp = cp.adapter.Heartbeat(cp.db)
+	return masterIsUp
+}
+
 // InitDB performs various initializations at start time
 func (cp *CmdProcessor) InitDB() error {
 	if logger.GetLogger().V(logger.Info) {
@@ -692,15 +731,7 @@ func (cp *CmdProcessor) InitDB() error {
 	}
 	cp.ctx = context.Background()
 	cp.db.SetMaxIdleConns(1)
-	ctx, cancel := context.WithTimeout(cp.ctx, time.Second*60)
-	defer cancel()
-	cp.conn, err = cp.db.Conn(ctx)
-	if err != nil {
-		if logger.GetLogger().V(logger.Warning) {
-			logger.GetLogger().Log(logger.Warning, "db connection error", err.Error())
-		}
-		return err
-	}
+	cp.db.SetMaxOpenConns(1)
 
 	//
 	cp.sqlParser, err = common.NewRegexSQLParser()
@@ -723,19 +754,25 @@ func (cp *CmdProcessor) InitDB() error {
 }
 
 func (cp *CmdProcessor) eor(code int, ns *netstring.Netstring) error {
+	if (code == common.EORFree) && cp.moreIncomingRequests() {
+		code = common.EORMoreIncomingRequests
+	}
 	if (code == common.EORFree) && (cp.calSessionTxn != nil) {
 		cp.calSessionTxn.Completed()
 		cp.calSessionTxn = nil
 	}
 	var payload []byte
 	if ns != nil {
-		payload = make([]byte, len(ns.Serialized)+1)
+		payload = make([]byte, len(ns.Serialized)+1 /*code*/ +2 /*rqId*/)
 		payload[0] = byte('0' + code)
-		copy(payload[1:], ns.Serialized)
+		payload[1] = byte(cp.rqId >> 8)
+		payload[2] = byte(cp.rqId & 0xFF)
+		copy(payload[3:], ns.Serialized)
 	} else {
-		payload = []byte{byte('0' + code)}
+		payload = []byte{byte('0' + code), byte(cp.rqId >> 8), byte(cp.rqId & 0xFF)}
 	}
-	return WriteAll(cp.SocketOut, netstring.NewNetstringFrom(common.CmdEOR, payload).Serialized)
+	cp.heartbeat = true
+	return WriteAll(cp.SocketOut, netstring.NewNetstringFrom(common.CmdEOR, payload))
 }
 
 func (cp *CmdProcessor) calExecErr(field string, err string) {
@@ -773,4 +810,8 @@ func (cp *CmdProcessor) preprocess(query string) string {
 		query = cp.regexBindName.ReplaceAllString(query, "?")
 	}
 	return query
+}
+
+func (cp *CmdProcessor) isIdle() bool {
+	return !(cp.inCursor) && !(cp.inTrans)
 }

@@ -22,8 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	_ "gopkg.in/goracle.v2"
+	"github.com/paypal/hera/utility/logger"
+	"github.com/paypal/hera/worker/shared"
 )
 
 type oracleAdapter struct {
@@ -53,6 +56,12 @@ func (adapter *oracleAdapter) UseBindNames() bool {
 }
 
 /**
+ * @TODO
+ */
+func (adapter *oracleAdapter) Heartbeat(db *sql.DB) (bool) {
+	return true
+}
+/**
  * @TODO infra.hera.jdbc.HeraResultSetMetaData mysql type to java type map.
  */
 var colTypeMap = map[string]int{
@@ -69,6 +78,15 @@ var colTypeMap = map[string]int{
 
 func (adapter *oracleAdapter) GetColTypeMap() map[string]int {
 	return colTypeMap
+}
+
+func (adapter *oracleAdapter) ProcessError(errToProcess error, workerScope *shared.WorkerScopeType, queryScope *shared.QueryScopeType) {
+        if logger.GetLogger().V(logger.Warning) {
+                logger.GetLogger().Log(logger.Warning, "oracle ProcessError "+ errToProcess.Error() + " "+ (*queryScope).SqlHash +" "+(*queryScope).NsCmd)
+        }
+        if strings.Contains(errToProcess.Error(), "ORA-03113") {
+                (*workerScope).Child_shutdown_flag = true
+        }
 }
 
 func (adapter *oracleAdapter) ProcessResult(colType string, res string) string {

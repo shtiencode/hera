@@ -52,6 +52,7 @@ type workerConfig struct {
 	clientSession    string
 	dbHostName       string
 	module           string
+	hbInterval       time.Duration // 0 will set to default
 }
 
 // Start is the initial method, performing the initializations and starting runworker() to wait for requests
@@ -69,7 +70,7 @@ func Start(adapter CmdProcessorAdapter) {
 	if logPrefix == "" {
 		logPrefix = "WORKER"
 	}
-	err = logger.CreateLogger("hera.log", logPrefix, int32(logLevel))
+	err = logger.CreateLogger(cfg.GetOrDefaultString("log_file", "hera.log"), logPrefix, int32(logLevel))
 	if err != nil {
 		return
 	}
@@ -94,6 +95,13 @@ func Start(adapter CmdProcessorAdapter) {
 	wconfig.dbHostName = os.Getenv(envDBHostName)
 	wconfig.module = os.Getenv(envModule)
 
+	wconfig.hbInterval = (time.Duration(cfg.GetOrDefaultInt("db_heartbeat_interval", 120)) * time.Second)
+	if wconfig.hbInterval == 0 {
+		wconfig.hbInterval = 120 * time.Second
+	}
+
+	logger.GetLogger().Log(logger.Info, "DB heartbeat interval:", wconfig.hbInterval)
+
 	evt := cal.NewCalEvent(cal.EventTypeServerInfo, "worker-go-start", cal.TransOK, "")
 	evt.Completed()
 	//
@@ -115,26 +123,46 @@ func Start(adapter CmdProcessorAdapter) {
 	//
 	// TODO: get real info
 	payload := []byte("0 MyDB")
-	WriteAll(sockMux, netstring.NewNetstringFrom(common.CmdControlMsg, payload).Serialized)
+	WriteAll(sockMux, netstring.NewNetstringFrom(common.CmdControlMsg, payload))
 	//
 	// start worker mainloop.
 	//
-	runworker(sockMux, cmdprocessor)
+	runworker(sockMux, cmdprocessor, wconfig)
 }
 
 // runworker is the infinite loop, serving requests
-func runworker(sockMux *os.File, cmdprocessor *CmdProcessor) {
+func runworker(sockMux *os.File, cmdprocessor *CmdProcessor, cfg *workerConfig) {
 	var ns *netstring.Netstring
 	var ok = true
 	var sig int
 	var err error
 
 	nschannel := readNextNetstring(sockMux)
+	cmdprocessor.moreIncomingRequests = func() bool {
+		return (len(nschannel) > 0)
+	}
 	sigchannel := waitForSignal()
 
 outerloop:
 	for {
 		select {
+		case <-time.After(cfg.hbInterval):
+			// heartbeat to DB only when the worker is free.
+			if cmdprocessor.heartbeat && cmdprocessor.isIdle() {
+				if logger.GetLogger().V(logger.Info) {
+					logger.GetLogger().Log(logger.Info, "sending heartbeat to DB")
+				}
+
+				ok := cmdprocessor.SendDbHeartbeat()
+				if !ok {
+					if logger.GetLogger().V(logger.Warning) {
+						logger.GetLogger().Log(logger.Warning, "master db is unavailable, worker exiting")
+					}
+					break outerloop
+				}
+			}
+			continue
+
 		case sig, ok = <-sigchannel:
 			if sig == signalRecover {
 				if logger.GetLogger().V(logger.Info) {
@@ -158,7 +186,9 @@ outerloop:
 				break outerloop
 			}
 		case ns, ok = <-nschannel:
+			cmdprocessor.rqId++
 		}
+
 		//
 		// @TODO let !ok go.
 		//
@@ -182,6 +212,9 @@ outerloop:
 			}
 
 			break outerloop
+		}
+		if cmdprocessor.WorkerScope.Child_shutdown_flag {
+			break
 		}
 	}
 
@@ -248,13 +281,13 @@ func waitForSignal() <-chan int {
 
 // recoverworker drains the mux channel and rollbacks the current transaction
 func recoverworker(cmdprocessor *CmdProcessor, nschannel <-chan *netstring.Netstring) error {
-	drainIncomingChannel(nschannel)
+	drainIncomingChannel(cmdprocessor, nschannel)
 	err := cmdprocessor.ProcessCmd(netstring.NewNetstringFrom(common.CmdRollback, []byte("")))
 	return err
 }
 
 // drainIncomingChannel clears the mux channel
-func drainIncomingChannel(nschannel <-chan *netstring.Netstring) {
+func drainIncomingChannel(cmdprocessor *CmdProcessor, nschannel <-chan *netstring.Netstring) {
 	for {
 		if logger.GetLogger().V(logger.Debug) {
 			logger.GetLogger().Log(logger.Debug, "draining nschannel")
@@ -267,13 +300,16 @@ func drainIncomingChannel(nschannel <-chan *netstring.Netstring) {
 				}
 				return
 			}
+			cmdprocessor.rqId++
 			if logger.GetLogger().V(logger.Debug) {
 				logger.GetLogger().Log(logger.Debug, "nschannel draining", DebugString(ns.Serialized))
 			}
 			//
 			// let readNextnetstring.Netstring reload nschannel if chann buffer was full.
 			//
-			time.Sleep(time.Microsecond * 10)
+			if len(nschannel) != 0 {
+				time.Sleep(time.Microsecond * 10)
+			}
 		default:
 			if logger.GetLogger().V(logger.Debug) {
 				logger.GetLogger().Log(logger.Debug, "draining: nschannel empty")

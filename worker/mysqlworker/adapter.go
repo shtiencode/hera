@@ -18,13 +18,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/paypal/hera/utility/logger"
+	"github.com/paypal/hera/worker/shared"
 )
 
 type mysqlAdapter struct {
@@ -47,10 +51,86 @@ func (adapter *mysqlAdapter) InitDB() (*sql.DB, error) {
 		return nil, errors.New("Can't get 'mysql_datasource' from env")
 	}
 
-	if logger.GetLogger().V(logger.Verbose) {
-		logger.GetLogger().Log(logger.Verbose, "connect string:", fmt.Sprintf("%s:%s@%s", user, pass, ds))
+	var db *sql.DB
+	var err error
+	is_writable := false
+	for idx, curDs := range strings.Split(ds, "||") {
+		db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@%s", user, pass, curDs))
+		if err != nil {
+			if logger.GetLogger().V(logger.Warning) {
+				logger.GetLogger().Log(logger.Warning, user+" failed to connect to "+curDs+fmt.Sprintf(" %d", idx))
+			}
+			continue
+		}
+		is_writable = adapter.Heartbeat(db);
+		if is_writable {
+			if logger.GetLogger().V(logger.Warning) {
+				logger.GetLogger().Log(logger.Warning, user+" connect success "+curDs+fmt.Sprintf(" %d", idx))
+			}
+			err = nil
+			break
+		} else {
+			// read only connection
+			if logger.GetLogger().V(logger.Warning) {
+				logger.GetLogger().Log(logger.Warning, "recycling, got read-only conn " /*+curDs*/)
+			}
+			err = errors.New("cannot use read-only conn "+curDs)
+			db.Close()
+		}
 	}
-	return sql.Open("mysql", fmt.Sprintf("%s:%s@%s", user, pass, ds))
+	return db, err
+}
+
+// Checking master status
+func (adapter *mysqlAdapter) Heartbeat(db *sql.DB) bool {
+	ctx, _ /*cancel*/ := context.WithTimeout(context.Background(), 10*time.Second)
+	writable := false
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		if logger.GetLogger().V(logger.Warning) {
+			logger.GetLogger().Log(logger.Warning, "could not get connection "+err.Error())
+		}
+		return writable
+	}
+	defer conn.Close()
+
+	if strings.HasPrefix(os.Getenv("logger.LOG_PREFIX"), "WORKER ") {
+		stmt, err := conn.PrepareContext(ctx, "select @@global.read_only")
+		//stmt, err := conn.PrepareContext(ctx, "show variables where variable_name='read_only'")
+		if err != nil {
+			if logger.GetLogger().V(logger.Warning) {
+				logger.GetLogger().Log(logger.Warning, "query ro check err ", err.Error())
+			}
+			return false
+		}
+		defer stmt.Close()
+
+		rows, err := stmt.Query()
+		if err != nil {
+			if logger.GetLogger().V(logger.Warning) {
+				logger.GetLogger().Log(logger.Warning, "ro check err ", err.Error())
+			}
+			return false
+		}
+		defer rows.Close()
+		countRows := 0
+		if rows.Next() {
+			countRows++
+			var readOnly int
+			/*var nom string
+			rows.Scan(&nom, &readOnly) // */
+			rows.Scan(&readOnly)
+			if readOnly == 0 {
+				writable = true
+			}
+		}
+
+		// read only connection
+		if logger.GetLogger().V(logger.Debug) {
+			logger.GetLogger().Log(logger.Debug, "writable:", writable)
+		}
+	}
+	return writable
 }
 
 // UseBindNames return false because the SQL string uses ? for bind parameters
@@ -80,6 +160,48 @@ var colTypeMap = map[string]int{
 
 func (adapter *mysqlAdapter) GetColTypeMap() map[string]int {
 	return colTypeMap
+}
+
+func (adapter *mysqlAdapter) ProcessError(errToProcess error, workerScope *shared.WorkerScopeType, queryScope *shared.QueryScopeType) {
+	errStr := errToProcess.Error()
+
+	if strings.HasPrefix(errStr, "driver: bad connection") {
+		if logger.GetLogger().V(logger.Warning) {
+			logger.GetLogger().Log(logger.Warning, "mysql ProcessError badConnRecycle "+ errStr + " sqlHash:"+ (*queryScope).SqlHash +" Cmd:"+(*queryScope).NsCmd)
+		}
+		(*workerScope).Child_shutdown_flag = true
+		return
+	}
+
+	idx := strings.Index(errStr, ":")
+	if idx < 0 || idx >= len(errStr) {
+            return
+        }
+	var errno int
+	fmt.Sscanf(errStr[6:idx],"%d",&errno)
+
+	if logger.GetLogger().V(logger.Warning) {
+		logger.GetLogger().Log(logger.Warning, "mysql ProcessError "+ errStr + " sqlHash:"+ (*queryScope).SqlHash +" Cmd:"+(*queryScope).NsCmd+fmt.Sprintf(" errno:%d",errno))
+	}
+
+	switch (errno) {
+	case 0: fallthrough // if there isn't a normal error number
+	case 1153: fallthrough // pkt too large
+	case 1154: fallthrough // read err fr pipe
+	case 1155: fallthrough // err fnctl
+	case 1156: fallthrough // pkt order
+	case 1157: fallthrough // err uncompress
+	case 1158: fallthrough // err read
+	case 1159: fallthrough // read timeout
+	case 1160: fallthrough // err write
+	case 1161: fallthrough // write timeout
+	case 1290: fallthrough // read-only mode
+	case 1317: fallthrough // query interupt
+	case 1836: fallthrough // read-only mode
+	case 1874: fallthrough // innodb read-only
+	case 1878: // temp file write fail
+		(*workerScope).Child_shutdown_flag = true
+	}
 }
 
 func (adapter *mysqlAdapter) ProcessResult(colType string, res string) string {
