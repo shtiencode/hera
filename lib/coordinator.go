@@ -520,43 +520,44 @@ func (crd *Coordinator) processClientInfoMuxCommand(clientInfo string) {
 	}
 
 
-	if crd.clientAZ == "" { 
-		prefix = "HOST: "
-		pos = strings.LastIndex(clientInfo, prefix)
-		// In order to make discovery work correctly, the client host's name must start with AZ
-		// This assumption is not applied to off-live the dev zone.
-		// Exclude ccg due to batch apps - 
-		ccgregexp := regexp.MustCompile("^ccg[0-9]+") // using the prefix of the hostname
-		dcgregexp := regexp.MustCompile("^dcg[0-9]+")
-		if pos != -1 {
-			pos += len(prefix)
-			crd.clientHostName = clientInfo[pos:]
-			end := strings.Index(crd.clientHostName, ",")
-			if end != -1 {
-				crd.clientHostName = crd.clientHostName[:end]
-				crd.clientHostName = strings.ToLower(strings.TrimSpace(crd.clientHostName))
+	prefix = "HOST: "
+	pos = strings.LastIndex(clientInfo, prefix)
+	ccgregexp := regexp.MustCompile("^ccg[0-9]+")
+	dcgregexp := regexp.MustCompile("^dcg[0-9]+")
+	if pos != -1 {
+		pos += len(prefix)
+		crd.clientHostName = clientInfo[pos:]
+		end := strings.Index(crd.clientHostName, ",")
+		if end != -1 {
+			crd.clientHostName = crd.clientHostName[:end]
+			crd.clientHostName = strings.ToLower(strings.TrimSpace(crd.clientHostName))
+			if logger.GetLogger().V(logger.Verbose) {
+				logger.GetLogger().Log(logger.Verbose, "AZApp: host is", crd.clientHostName)
+			}
+			var tmpaz [] string
+			if tmpaz = ccgregexp.FindStringSubmatch(crd.clientHostName); tmpaz != nil  {
 				if logger.GetLogger().V(logger.Verbose) {
-					logger.GetLogger().Log(logger.Verbose, "clienthost:", crd.clientHostName)
+					logger.GetLogger().Log(logger.Verbose, "AZApp: skip ccg host")
 				}
-				var tmpaz [] string
-				if tmpaz = ccgregexp.FindStringSubmatch(crd.clientHostName); tmpaz != nil  {
-					crd.clientAZ = "" // we don't throttle or evict on ccg 
-				} else if tmpaz = dcgregexp.FindStringSubmatch(crd.clientHostName); tmpaz != nil  {
-					crd.clientAZ = tmpaz[0]
-				} else {
-					if logger.GetLogger().V(logger.Verbose) {
-						logger.GetLogger().Log(logger.Verbose, "clienthost is not ccg nor dcg")
-					}
-					// unrecognized pattern will be evaluated
-					crd.clientAZ = "others"
-				}
+				crd.clientAZ = "" // we don't throttle or evict on ccg 
+			} else if tmpaz = dcgregexp.FindStringSubmatch(crd.clientHostName); tmpaz != nil  {
+				crd.clientAZ = tmpaz[0]
 			} else {
-				// client info is unavailable, case will be evaluated
-				crd.clientAZ = "unavbl"
+				if logger.GetLogger().V(logger.Verbose) {
+					logger.GetLogger().Log(logger.Verbose, "AZApp: host is not ccg nor dcg")
+				}
+				// unrecognized pattern will be evaluated
+				crd.clientAZ = "others"
 			}
-			if logger.GetLogger().V(logger.Debug) {
-				logger.GetLogger().Log(logger.Debug, "AZApp: request source AZ: [", crd.clientAZ, "]")
+		} else {
+			// client info is unavailable, case will be evaluated
+			crd.clientAZ = "unavbl"
+			if logger.GetLogger().V(logger.Verbose) {
+				logger.GetLogger().Log(logger.Verbose, "AZApp: host is unavailable")
 			}
+		}
+		if logger.GetLogger().V(logger.Debug) {
+			logger.GetLogger().Log(logger.Debug, "AZApp: request source AZ: [", crd.clientAZ, "]")
 		}
 	}
 
@@ -657,9 +658,9 @@ func (crd *Coordinator) dispatchRequest(request *netstring.Netstring) error {
 		bindkv := parseBinds(request)
 		// srcAZApp to looks up the AZ + App name
 		if crd.clientAZ != "" {
-			bindkv[SrcAZAppKey] = fmt.Sprintf("s|%s", crd.clientAZ, crd.poolName)
+			bindkv[SrcAZAppKey] = fmt.Sprintf("%s&%s", crd.clientAZ, crd.poolName)
 			if logger.GetLogger().V(logger.Debug) {
-				msg := fmt.Sprintf("AZApp: bind throttle set az|app: %s|%s", crd.clientAZ, crd.poolName)
+				msg := fmt.Sprintf("AZApp: bind throttle set az-app: %s", bindkv[SrcAZAppKey])
 				logger.GetLogger().Log(logger.Debug, msg)
 			}
 		}
